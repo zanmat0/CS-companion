@@ -1,73 +1,165 @@
-import threading
 import discord
 from discord.ext import commands
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import asyncio
+import sounddevice as sd
+import numpy as np
+import whisper
+import tempfile
+from scipy.io.wavfile import write
+import pyttsx3
+from dotenv import load_dotenv
+import os
+import sys
+import traceback
 
-DISCORD_TOKEN = "Ditt_Discord_Token_Her"
-DISCORD_CHANNEL_NAME = "general"  # Endre til din kanal
+# ========== Global feil-logg ==========
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    print("[💥 GLOBAL EXCEPTION]")
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
 
-# Flask app for GSI
-app = Flask(__name__)
-CORS(app)
+sys.excepthook = global_exception_handler
 
-# Discord bot-setup
+# ========== Konfigurasjon ==========
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+TRIGGER_WORD = os.getenv("TRIGGER_WORD", "taktikk").lower()
+SAMPLE_SECONDS = int(os.getenv("SAMPLE_SECONDS", 4))
+SAMPLE_RATE = 16000
+COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "!")
+DEFAULT_MAP = os.getenv("MAP", "mirage").lower()
+DEFAULT_SIDE = os.getenv("SIDE", "ct").lower()
+
+MODEL = whisper.load_model("medium")
+
+# ========== Taktikkdatabase ==========
+TACTICS = {
+    "mirage": {
+        "ct": [
+            "Hold B passivt med en i jungle klar til å rotere.",
+            "Spill 2 B, 2 mid, og en på A. Roter raskt ved push.",
+            "Boost mid tidlig og fall tilbake om ingen info."
+        ],
+        "t": [
+            "Rush mid til connector, smoke window.",
+            "Gå A kontakt med en lurk palace.",
+            "Fake B, roter til A etter 10 sek."
+        ]
+    }
+}
+
+# ========== State ==========
+current_map = None
+current_side = None
+current_vc = None
+
+# ========== Bot-oppsett ==========
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-discord_channel = None
+intents.message_content = True
+intents.voice_states = True
 
-# Status-tracking
-last_round = -1
-last_winner = None
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
-@app.route("/gsi", methods=["POST"])
-def gsi():
-    global last_round, last_winner
-
-    data = request.json
-
-    round_phase = data.get("round", {}).get("phase")
-    map_info = data.get("map", {})
-    team_ct = map_info.get("team_ct", {}).get("score", 0)
-    team_t = map_info.get("team_t", {}).get("score", 0)
-    round_number = map_info.get("round", 0)
-
-    # Bare send hvis ny runde
-    if round_number != last_round and round_phase == "over":
-        last_round = round_number
-        if team_ct > team_t:
-            last_winner = "Counter-Terrorists"
-        else:
-            last_winner = "Terrorists"
-
-        if discord_channel:
-            text = f"💥 Runde {round_number} er ferdig. Vinner: **{last_winner}** (CT: {team_ct} - T: {team_t})"
-            coro = discord_channel.send(text)
-            fut = discord_client.loop.create_task(coro)
-
-    return jsonify({"status": "ok"})
-
-# Flask-kjøring i egen tråd
-def run_flask():
-    app.run(host="0.0.0.0", port=3000)
-
-# Discord-bot startup
 @bot.event
 async def on_ready():
-    global discord_channel
-    print(f"[DISCORD] Logget inn som {bot.user}")
-    for guild in bot.guilds:
-        for channel in guild.text_channels:
-            if channel.name == DISCORD_CHANNEL_NAME:
-                discord_channel = channel
-                print(f"[DISCORD] Fant kanal: {channel.name}")
-                return
+    print(f"[✅] Bot er online som {bot.user}")
 
-# Start Flask server i bakgrunnen
-flask_thread = threading.Thread(target=run_flask)
-flask_thread.daemon = True
-flask_thread.start()
+@bot.command(name="start")
+async def start_game(ctx, map_name: str = DEFAULT_MAP, side: str = DEFAULT_SIDE):
+    global current_map, current_side, current_vc
 
-# Start Discord bot
-discord_client = bot
-bot.run(DISCORD_TOKEN)
+    map_name = map_name.lower()
+    side = side.lower()
+
+    if map_name not in TACTICS:
+        await ctx.send(f"❌ Ukjent map: {map_name}")
+        return
+    if side not in ["ct", "t"]:
+        await ctx.send("❌ Side må være enten 'ct' eller 't'")
+        return
+
+    if ctx.author.voice:
+        current_vc = await ctx.author.voice.channel.connect()
+        await ctx.send(f"🔊 Bli med i {ctx.author.voice.channel.name} – jeg hører etter '{TRIGGER_WORD}'...")
+    else:
+        await ctx.send("⚠️ Du må være i en voice channel for at jeg skal kunne høre deg!")
+        return
+
+    current_map = map_name
+    current_side = side
+    await ctx.send(f"🎯 Klar for **{map_name.upper()}** som **{side.upper()}**. Si “{TRIGGER_WORD}” for callout.")
+
+    asyncio.create_task(safe_listen_wrapper(ctx))
+
+async def safe_listen_wrapper(ctx):
+    try:
+        await listen_for_trigger(ctx)
+    except Exception as e:
+        print(f"[💥] FEIL i lytte-loop: {e}")
+        await ctx.send(f"❌ Feil i lytte-loop: {e}")
+
+async def listen_for_trigger(ctx):
+    print("[👂] Lytter etter trigger...")
+
+    while True:
+        await asyncio.sleep(1)
+        try:
+            print("[🎙️] Opptak starter...")
+            recording = sd.rec(int(SAMPLE_SECONDS * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='int16')
+            sd.wait()
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpfile:
+                write(tmpfile.name, SAMPLE_RATE, recording)
+                print(f"[🧠] Whisper-transkribering: {tmpfile.name}")
+                result = MODEL.transcribe(tmpfile.name, language='no')
+
+            text = result.get("text", "").strip().lower()
+            print(f"[📝] Gjenkjent tekst: {text}")
+
+            if any(trigger in text for trigger in [TRIGGER_WORD, TRIGGER_WORD.replace('k', 'g'), TRIGGER_WORD.replace('kk', 'k'), TRIGGER_WORD.upper()]) and current_map and current_side:
+                call = get_call()
+                await ctx.send(f"📣 **Taktikk** ({current_map.upper()} | {current_side.upper()}): {call}")
+                await speak_text(call)
+            else:
+                print("[⏭️] Trigger ikke oppdaget.")
+
+        except Exception as err:
+            print(f"[🚨] Opptak/transkripsjon-feil: {err}")
+
+def get_call():
+    return np.random.choice(TACTICS[current_map][current_side])
+
+async def speak_text(text):
+    try:
+        print(f"[🔊] Leser opp: {text}")
+        engine = pyttsx3.init()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf:
+            engine.save_to_file(text, tf.name)
+            engine.runAndWait()
+            wav_path = tf.name
+
+        if current_vc and current_vc.is_connected():
+            current_vc.play(discord.FFmpegPCMAudio(wav_path))
+            while current_vc.is_playing():
+                await asyncio.sleep(0.5)
+    except Exception as e:
+        print(f"[🔇] FEIL i TTS/avspilling: {e}")
+
+@bot.command(name="disconnect")
+async def disconnect(ctx):
+    global current_vc
+    if current_vc:
+        await current_vc.disconnect()
+        current_vc = None
+        await ctx.send("🔇 Botten har forlatt voice.")
+
+# ========== Start bot ==========
+if __name__ == "__main__":
+    try:
+        print("[🚀] Starter bot...")
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f"[💥] Bot run feilet: {e}")
