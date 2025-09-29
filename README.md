@@ -200,7 +200,6 @@ Tips for natural TTS pacing:
   - `[🔊] Spiller av i Discord...`
 
 ### Windows notes
-- If you prefer batch scripts, add `install.bat` / `run.bat`
 - Make sure Python and FFmpeg are in PATH
 - If using WSL, `install.sh` works as-is
 
@@ -227,4 +226,5 @@ pyttsx3
 ## 📜 License
 
 MIT — use freely for fragging and fun.
+
 
