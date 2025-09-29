@@ -5,10 +5,12 @@ def trigger():
     print("🔘 Trigger sendes...")
     try:
         res = requests.post("http://localhost:8000/trigger", json={})
-        if res.ok:
-            print(f"✅ Taktikk: {res.json().get('tactic')}")
+        data = res.json() if res.ok else {}
+        tactic = data.get("tactic")
+        if tactic:
+            print(f"✅ Taktikk: {tactic}")
         else:
-            print(f"⚠️ Feil fra server: {res.status_code} {res.text}")
+            print(f"⚠️ Feil: {data.get('message')}")
     except Exception as e:
         print(f"❌ Feil ved sending: {e}")
 
