@@ -224,23 +224,7 @@ pyttsx3
 
 ---
 
-## 🛣️ Roadmap Ideas
-
-- `!next` — random tactic via Discord (no hotkey)
-- `!current` — print current map/side
-- Role-based lines (`entry`, `support`, `lurker`)
-- `/trigger/{map}/{side}` endpoint
-- Configurable pacing/emphasis presets
-
----
-
-## 🙌 Credits
-
-Built by **Håvard Kjelle**.  
-Powered by **discord.py**, **FastAPI**, **FFmpeg**, and **ElevenLabs**.
-
----
-
 ## 📜 License
 
 MIT — use freely for fragging and fun.
+
